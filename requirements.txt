@@ -1,0 +1,13 @@
+aiohttp>=3.9.0
+aiofiles>=23.0.0
+networkx>=3.0
+mmh3>=4.0.0
+bitarray>=2.8.0
+ujson>=5.0.0
+numpy>=1.24.0
+ijson>=3.2.0
+matplotlib>=3.5.0
+plotly>=5.0.0
+pyvis>=0.3.0
+python-louvain>=0.16
+python-dotenv>=1.0.0 
