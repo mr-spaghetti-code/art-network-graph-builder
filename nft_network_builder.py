@@ -822,9 +822,9 @@ async def main():
     import sys
     if len(sys.argv) < 2:
         logger.error("Usage:")
-        logger.error("  For NFT contract: python punk_graph.py --contract <contract_address>")
-        logger.error("  For wallet(s): python punk_graph.py --wallet <wallet_address> [wallet2 wallet3 ...]")
-        logger.error("  Default (CryptoPunks): python punk_graph.py")
+        logger.error("  For NFT contract: python nft_network_builder.py --contract <contract_address>")
+        logger.error("  For wallet(s): python nft_network_builder.py --wallet <wallet_address> [wallet2 wallet3 ...]")
+        logger.error("  Default (CryptoPunks): python nft_network_builder.py")
         
         # Default to CryptoPunks for backward compatibility
         mode = "contract"

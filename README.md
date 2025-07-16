@@ -1,10 +1,29 @@
 # NFT Network Builder with Alchemy
 
-This tool builds a network graph of NFT collectors by analyzing shared ownership patterns using the Alchemy API.
+This repository contains tools for building network graphs of NFT collectors by analyzing shared ownership patterns using the Alchemy API.
 
 ## ⚠️ API Key Required
 
-**You must have an Alchemy API key to use this tool.** Get a free API key at [Alchemy.com](https://www.alchemy.com/).
+**You must have an Alchemy API key to use these tools.** Get a free API key at [Alchemy.com](https://www.alchemy.com/).
+
+## 🆕 Generic NFT Network Builder
+
+**New Feature**: Build networks for ANY NFT contract on Ethereum!
+
+### Quick Start
+
+```bash
+# Create .env file
+echo "ALCHEMY_API_KEY=your_api_key_here" > .env
+
+# Run with any contract address
+python nft_network_builder.py 0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D
+
+# Or use shortcuts for popular collections
+python run_nft_network.py bayc
+```
+
+See [README_nft_network.md](README_nft_network.md) for detailed documentation on the generic NFT network builder.
 
 ## Migration from Moralis to Alchemy
 
