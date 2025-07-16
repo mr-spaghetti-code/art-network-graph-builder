@@ -17,6 +17,10 @@ import ujson  # faster json
 from functools import lru_cache
 import logging
 import glob
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Set up logging
 logging.basicConfig(
@@ -727,12 +731,12 @@ class NFTGraphBuilder:
 
 # usage
 async def main():
-    # IMPORTANT: Replace with your actual Alchemy API key
-    # Get one free at https://www.alchemy.com/
-    api_key = "udoeLey_dG0T07ILOX6VJEkafZPsZGuQ"  # <-- REPLACE THIS!
+    # Load API key from environment variable
+    api_key = os.getenv("ALCHEMY_API_KEY")
     
-    if api_key == "YOUR_ALCHEMY_API_KEY_HERE":
-        logger.error("Please replace 'YOUR_ALCHEMY_API_KEY_HERE' with your actual Alchemy API key!")
+    if not api_key:
+        logger.error("ALCHEMY_API_KEY environment variable not found!")
+        logger.error("Please create a .env file with: ALCHEMY_API_KEY=your_actual_key_here")
         logger.error("Get a free API key at https://www.alchemy.com/")
         return
     
