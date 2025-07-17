@@ -38,11 +38,30 @@ class OptimizedCheckpointToGraph:
     def __init__(self, checkpoint_dir: str = "./checkpoints", 
                  use_parallel: bool = True,
                  num_workers: Optional[int] = None,
-                 chunk_size: int = 10000):
+                 chunk_size: int = 10000,
+                 holders_file: Optional[str] = None):
         self.checkpoint_dir = checkpoint_dir
         self.use_parallel = use_parallel
         self.num_workers = num_workers or mp.cpu_count()
         self.chunk_size = chunk_size
+        self.holders_file = holders_file
+    
+    def load_holders(self) -> Set[str]:
+        """Load holder addresses from holders file"""
+        holders = set()
+        
+        if self.holders_file and os.path.exists(self.holders_file):
+            logger.info(f"Loading holders from {self.holders_file}")
+            with open(self.holders_file, 'r') as f:
+                for line in f:
+                    address = line.strip().lower()  # Normalize to lowercase
+                    if address:
+                        holders.add(address)
+            logger.info(f"Loaded {len(holders)} holder addresses")
+        else:
+            logger.warning(f"Holders file not found or not specified: {self.holders_file}")
+            
+        return holders
         
     @timed
     def list_checkpoints(self) -> List[dict]:
@@ -98,6 +117,10 @@ class OptimizedCheckpointToGraph:
                 logger.info(f"Stats from checkpoint:")
                 for key, value in data["stats"].items():
                     logger.info(f"  - {key}: {value}")
+            
+            # Log seed wallets if present
+            if "seed_wallets" in data:
+                logger.info(f"Found {len(data['seed_wallets'])} seed wallets in checkpoint")
                     
             return data
         except Exception as e:
@@ -106,7 +129,7 @@ class OptimizedCheckpointToGraph:
     
     def _load_checkpoint_streaming(self, checkpoint_path: str) -> dict:
         """Stream parse large JSON files to reduce memory usage"""
-        data = {"edges": {}, "wallet_to_contracts": {}, "stats": {}}
+        data = {"edges": {}, "wallet_to_contracts": {}, "stats": {}, "seed_wallets": []}
         
         try:
             with open(checkpoint_path, 'rb') as f:
@@ -129,6 +152,8 @@ class OptimizedCheckpointToGraph:
                     elif prefix.startswith("wallet_to_contracts.") and event == "string":
                         if current_section == "wallet_to_contracts" and current_key:
                             data["wallet_to_contracts"][current_key].append(value)
+                    elif prefix.startswith("seed_wallets.item") and event == "string":
+                        data["seed_wallets"].append(value)
                     elif prefix.startswith("stats."):
                         key = prefix.split(".")[-1]
                         if event in ["string", "number"]:
@@ -167,6 +192,15 @@ class OptimizedCheckpointToGraph:
         
         edges_dict = checkpoint_data.get("edges", {})
         wallet_to_contracts = checkpoint_data.get("wallet_to_contracts", {})
+        
+        # Load seed wallets from holders file if available, otherwise from checkpoint
+        if self.holders_file:
+            seed_wallets = self.load_holders()
+        else:
+            seed_wallets = set(checkpoint_data.get("seed_wallets", []))
+            
+        if seed_wallets:
+            logger.info(f"Found {len(seed_wallets)} seed wallets")
         
         # Pre-convert all contract lists to sets for O(1) lookup
         logger.info("Pre-processing contract data...")
@@ -226,12 +260,35 @@ class OptimizedCheckpointToGraph:
         
         # Bulk add node attributes
         logger.info("Adding node attributes...")
-        node_attrs = {
-            wallet: {'num_contracts': len(contracts)}
-            for wallet, contracts in wallet_to_contracts.items()
-            if wallet in G
-        }
+        node_attrs = {}
+        seed_node_count = 0
+        
+        for wallet in G.nodes():
+            attrs = {}
+            
+            # Add contract count if available
+            if wallet in wallet_to_contracts:
+                attrs['num_contracts'] = len(wallet_to_contracts[wallet])
+            
+            # Add seed attributes if this is a seed wallet
+            # Normalize wallet address for comparison
+            if wallet.lower() in seed_wallets:
+                attrs['seed'] = True
+                attrs['Label'] = 'Seed'  # Capital L for Gephi
+                attrs['label'] = 'Seed'  # Keep lowercase for backward compatibility
+                seed_node_count += 1
+            else:
+                # Label all non-seed nodes as "Other"
+                attrs['Label'] = 'Other'  # Capital L for Gephi
+                attrs['label'] = 'Other'  # Keep lowercase for backward compatibility
+            
+            # Always add node attributes since every node now has at least a label
+            node_attrs[wallet] = attrs
+        
         nx.set_node_attributes(G, node_attrs)
+        
+        if seed_node_count > 0:
+            logger.info(f"Marked {seed_node_count} nodes as seed nodes")
         
         # Count edges without contract data
         skipped_edges = sum(1 for _, _, w in edges_with_weights if w == 1)
@@ -285,6 +342,83 @@ class OptimizedCheckpointToGraph:
         return edges_with_weights
     
     @timed
+    def calculate_unique_contracts(self, checkpoint_data: dict, G: Optional[nx.Graph] = None) -> dict:
+        """Calculate the number of unique contracts in the network
+        
+        Args:
+            checkpoint_data: The checkpoint data dictionary containing wallet_to_contracts
+            G: Optional graph - if provided, only count contracts for wallets in the graph
+            
+        Returns:
+            Dictionary with contract statistics
+        """
+        logger.info("Calculating unique contracts...")
+        
+        wallet_to_contracts = checkpoint_data.get("wallet_to_contracts", {})
+        
+        # If graph is provided, filter to only wallets in the graph
+        if G is not None:
+            graph_wallets = set(G.nodes())
+            wallet_to_contracts = {
+                wallet: contracts 
+                for wallet, contracts in wallet_to_contracts.items() 
+                if wallet in graph_wallets
+            }
+            logger.info(f"Filtering to {len(wallet_to_contracts)} wallets present in graph")
+        
+        # Collect all unique contracts
+        all_contracts = set()
+        total_contract_instances = 0
+        wallets_with_contracts = 0
+        contract_counts = []
+        
+        for wallet, contracts in wallet_to_contracts.items():
+            if contracts:
+                wallets_with_contracts += 1
+                contract_list = contracts if isinstance(contracts, list) else list(contracts)
+                all_contracts.update(contract_list)
+                total_contract_instances += len(contract_list)
+                contract_counts.append(len(contract_list))
+        
+        # Calculate statistics
+        stats = {
+            "unique_contracts": len(all_contracts),
+            "total_contract_instances": total_contract_instances,
+            "wallets_with_contracts": wallets_with_contracts,
+            "avg_contracts_per_wallet": total_contract_instances / wallets_with_contracts if wallets_with_contracts > 0 else 0,
+        }
+        
+        if contract_counts:
+            stats.update({
+                "max_contracts_per_wallet": max(contract_counts),
+                "min_contracts_per_wallet": min(contract_counts),
+                "median_contracts_per_wallet": np.median(contract_counts),
+            })
+        
+        # Find most popular contracts
+        if all_contracts:
+            contract_popularity = defaultdict(int)
+            for wallet, contracts in wallet_to_contracts.items():
+                contract_list = contracts if isinstance(contracts, list) else list(contracts)
+                for contract in contract_list:
+                    contract_popularity[contract] += 1
+            
+            # Get top 10 most popular contracts
+            top_contracts = sorted(contract_popularity.items(), key=lambda x: x[1], reverse=True)[:10]
+            stats["top_10_contracts"] = top_contracts
+            
+            # Average popularity
+            popularities = list(contract_popularity.values())
+            stats["avg_contract_popularity"] = np.mean(popularities)
+            stats["max_contract_popularity"] = max(popularities)
+        
+        logger.info(f"Found {stats['unique_contracts']:,} unique contracts")
+        logger.info(f"Total contract instances: {stats['total_contract_instances']:,}")
+        logger.info(f"Wallets with contracts: {stats['wallets_with_contracts']:,}")
+        
+        return stats
+    
+    @timed
     def analyze_graph(self, G: nx.Graph) -> dict:
         """Optimized graph analysis using numpy and efficient algorithms"""
         logger.info("Analyzing graph...")
@@ -297,6 +431,12 @@ class OptimizedCheckpointToGraph:
             "num_edges": num_edges,
             "density": nx.density(G),
         }
+        
+        # Count seed nodes
+        seed_nodes = [n for n, attrs in G.nodes(data=True) if attrs.get('seed', False)]
+        if seed_nodes:
+            stats["num_seed_nodes"] = len(seed_nodes)
+            stats["seed_node_percentage"] = (len(seed_nodes) / num_nodes) * 100
         
         # Use numpy for efficient degree statistics
         degrees = np.array([d for _, d in G.degree()])
@@ -313,6 +453,12 @@ class OptimizedCheckpointToGraph:
             nodes = list(G.nodes())
             stats["top_5_nodes"] = [(nodes[i], int(degrees[i])) 
                                    for i in sorted(top_indices, key=lambda x: degrees[x], reverse=True)]
+            
+            # Find top seed nodes by degree if any exist
+            if seed_nodes:
+                seed_degrees = [(node, G.degree(node)) for node in seed_nodes]
+                seed_degrees.sort(key=lambda x: x[1], reverse=True)
+                stats["top_5_seed_nodes"] = seed_degrees[:5]
         
         # Efficient connected components analysis
         if num_nodes < 100000:  # Only for smaller graphs
@@ -362,11 +508,22 @@ class OptimizedCheckpointToGraph:
                     for node in G.nodes():
                         # Use number of contracts as val, fallback to degree if not available
                         val = G.nodes[node].get('num_contracts', G.degree(node))
-                        nodes.append({
+                        node_data = {
                             "id": node,
                             "name": node,
                             "val": val
-                        })
+                        }
+                        
+                        # Add seed attribute if present
+                        if G.nodes[node].get('seed', False):
+                            node_data['seed'] = True
+                            node_data['label'] = 'Seed'
+                            node_data['Label'] = 'Seed'  # Capital L for Gephi compatibility
+                        else:
+                            node_data['label'] = 'Other'
+                            node_data['Label'] = 'Other'  # Capital L for Gephi compatibility
+                        
+                        nodes.append(node_data)
                     
                     links = []
                     for source, target in G.edges():
@@ -420,6 +577,8 @@ def main():
                        help="Use streaming parser for large JSON files (requires ijson)")
     parser.add_argument("--filter-discovered-only", action="store_true",
                        help="Only include edges between wallets with contract data (discovered wallets)")
+    parser.add_argument("--holders-file", default="holders.txt",
+                       help="File containing holder addresses (one per line) to mark as seed nodes")
     
     args = parser.parse_args()
     
@@ -428,7 +587,8 @@ def main():
         checkpoint_dir=args.checkpoint_dir,
         use_parallel=not args.no_parallel,
         num_workers=args.workers,
-        chunk_size=args.chunk_size
+        chunk_size=args.chunk_size,
+        holders_file=args.holders_file
     )
     
     # Record total time
@@ -475,13 +635,27 @@ def main():
             stats = converter.analyze_graph(graph)
             logger.info("\n=== Graph Analysis ===")
             for key, value in stats.items():
-                if key == "top_5_nodes":
+                if key in ["top_5_nodes", "top_5_seed_nodes"]:
                     logger.info(f"{key}:")
                     for wallet, degree in value:
                         logger.info(f"  - {wallet[:8]}...: {degree} connections")
                 else:
                     logger.info(f"{key}: {value}")
             logger.info("====================\n")
+            
+            # Also analyze contracts
+            contract_stats = converter.calculate_unique_contracts(checkpoint_data, graph)
+            logger.info("\n=== Contract Analysis ===")
+            for key, value in contract_stats.items():
+                if key == "top_10_contracts":
+                    logger.info(f"{key}:")
+                    for contract, count in value:
+                        logger.info(f"  - {contract[:8]}...: held by {count} wallets")
+                elif isinstance(value, float):
+                    logger.info(f"{key}: {value:.2f}")
+                else:
+                    logger.info(f"{key}: {value}")
+            logger.info("========================\n")
         
         # Save graph
         converter.save_graph(graph, args.output, args.formats)

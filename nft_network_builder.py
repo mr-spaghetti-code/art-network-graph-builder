@@ -18,6 +18,7 @@ from functools import lru_cache
 import logging
 import glob
 from dotenv import load_dotenv
+import gzip
 
 # Load environment variables from .env file
 load_dotenv()
@@ -148,7 +149,11 @@ class NFTGraphBuilder:
     
     def get_latest_checkpoint(self) -> Optional[str]:
         """Find the latest checkpoint file in the checkpoint directory"""
-        checkpoint_files = glob.glob(os.path.join(self.checkpoint_dir, "checkpoint_*.json"))
+        # Look for both new pickle and old JSON checkpoints
+        pickle_files = glob.glob(os.path.join(self.checkpoint_dir, "checkpoint_*.pkl.gz"))
+        json_files = glob.glob(os.path.join(self.checkpoint_dir, "checkpoint_*.json"))
+        
+        checkpoint_files = pickle_files + json_files
         if not checkpoint_files:
             return None
         
@@ -168,11 +173,21 @@ class NFTGraphBuilder:
         try:
             # For large files, read in chunks to avoid memory issues
             file_size = os.path.getsize(checkpoint_path)
-            logger.info(f"Checkpoint file size: {file_size / (1024**3):.2f} GB")
+            logger.info(f"Checkpoint file size: {file_size / (1024**2):.2f} MB")
             
-            async with aiofiles.open(checkpoint_path, 'r') as f:
-                content = await f.read()
-                data = ujson.loads(content)
+            # Check if it's a pickle file (new format) or json (old format)
+            if checkpoint_path.endswith('.pkl.gz'):
+                # New compressed pickle format
+                with gzip.open(checkpoint_path, 'rb') as f:
+                    data = pickle.load(f)
+            elif checkpoint_path.endswith('.json'):
+                # Old JSON format (for backward compatibility)
+                async with aiofiles.open(checkpoint_path, 'r') as f:
+                    content = await f.read()
+                    data = ujson.loads(content)
+            else:
+                logger.error(f"Unknown checkpoint format: {checkpoint_path}")
+                return None
                 
             logger.info(f"Checkpoint loaded successfully")
             return data
@@ -181,31 +196,65 @@ class NFTGraphBuilder:
             logger.error(f"Error loading checkpoint: {e}")
             return None
     
-    def restore_state_from_checkpoint(self, checkpoint_data: Dict) -> List[WalletPriority]:
+    def restore_state_from_checkpoint(self, checkpoint_data: Dict) -> Tuple[List[WalletPriority], Optional[set]]:
         """Restore the builder state from checkpoint data"""
         logger.info("Restoring state from checkpoint...")
         
         # Restore visited wallets
-        visited_wallets_list = checkpoint_data.get("visited_wallets", [])
-        for wallet in visited_wallets_list:
-            self.visited_wallets.add(wallet)
-            self.visited_wallets_exact.add(wallet)
-        logger.info(f"Restored {len(visited_wallets_list)} visited wallets")
+        visited_wallets_data = checkpoint_data.get("visited_wallets", [])
+        # Handle both list (old JSON format) and set (new pickle format)
+        if isinstance(visited_wallets_data, list):
+            for wallet in visited_wallets_data:
+                self.visited_wallets.add(wallet)
+                self.visited_wallets_exact.add(wallet)
+        else:  # It's already a set from pickle
+            self.visited_wallets_exact = visited_wallets_data
+            for wallet in visited_wallets_data:
+                self.visited_wallets.add(wallet)
+        logger.info(f"Restored {len(self.visited_wallets_exact)} visited wallets")
         
         # Restore contract to owners mapping
         contract_to_owners_data = checkpoint_data.get("contract_to_owners", {})
-        self.contract_to_owners = {k: set(v) for k, v in contract_to_owners_data.items()}
+        # Handle both formats
+        if contract_to_owners_data:
+            # Check if it's old format (lists) or new format (sets)
+            sample_value = next(iter(contract_to_owners_data.values()), None)
+            if sample_value is not None and isinstance(sample_value, list):
+                # Old format: values are lists, convert to sets
+                self.contract_to_owners = {k: set(v) for k, v in contract_to_owners_data.items()}
+            else:
+                # New format: values are already sets
+                self.contract_to_owners = contract_to_owners_data
         logger.info(f"Restored {len(self.contract_to_owners)} contract-to-owners mappings")
         
         # Restore wallet to contracts mapping
         wallet_to_contracts_data = checkpoint_data.get("wallet_to_contracts", {})
-        self.wallet_to_contracts = {k: set(v) for k, v in wallet_to_contracts_data.items()}
+        # Handle both formats
+        if wallet_to_contracts_data:
+            # Check if it's old format (lists) or new format (sets)
+            sample_value = next(iter(wallet_to_contracts_data.values()), None)
+            if sample_value is not None and isinstance(sample_value, list):
+                # Old format: values are lists, convert to sets
+                self.wallet_to_contracts = {k: set(v) for k, v in wallet_to_contracts_data.items()}
+            else:
+                # New format: values are already sets
+                self.wallet_to_contracts = wallet_to_contracts_data
         logger.info(f"Restored {len(self.wallet_to_contracts)} wallet-to-contracts mappings")
         
         # Restore edges
         edges_data = checkpoint_data.get("edges", {})
-        for wallet, connections in edges_data.items():
-            self.edges[wallet] = set(connections)
+        # Handle both formats
+        if edges_data:
+            # Check if it's old format (lists) or new format (sets/defaultdict)
+            sample_value = next(iter(edges_data.values()), None)
+            if sample_value is not None and isinstance(sample_value, list):
+                # Old format: values are lists, convert to sets
+                for wallet, connections in edges_data.items():
+                    self.edges[wallet] = set(connections)
+            else:
+                # New format: values are already sets
+                # Convert regular dict back to defaultdict
+                self.edges = defaultdict(set, edges_data)
         logger.info(f"Restored edges for {len(self.edges)} wallets")
         
         # Restore stats
@@ -223,7 +272,15 @@ class NFTGraphBuilder:
             heapq.heappush(priority_queue, WalletPriority(wallet, depth, priority))
         logger.info(f"Restored priority queue with {len(priority_queue)} items")
         
-        return priority_queue
+        # Restore seed wallets
+        seed_wallets = None
+        if "seed_wallets" in checkpoint_data:
+            seed_data = checkpoint_data["seed_wallets"]
+            # Handle both list and set formats
+            seed_wallets = set(seed_data) if isinstance(seed_data, list) else seed_data
+            logger.info(f"Restored {len(seed_wallets)} seed wallets")
+        
+        return priority_queue, seed_wallets
     
     async def get_all_contract_holders(self, contract_address: str) -> Set[str]:
         """Fetch all holders of a given NFT contract"""
@@ -241,7 +298,9 @@ class NFTGraphBuilder:
             url = f"{self.base_url}/getOwnersForContract"
             params = {
                 "contractAddress": contract_address,
-                "withTokenBalances": "false"
+                "withTokenBalances": "false",
+                "excludeFilters[]": "SPAM",
+                "spamConfidenceLevel": "HIGH"
             }
             
             if page_key:
@@ -358,7 +417,9 @@ class NFTGraphBuilder:
             url = f"{self.base_url}/getContractsForOwner"
             params = {
                 "owner": address,
-                "withMetadata": "false"
+                "withMetadata": "false",
+                "excludeFilters[]": "SPAM",
+                "spamConfidenceLevel": "HIGH"
             }
             
             if page_key:
@@ -449,7 +510,9 @@ class NFTGraphBuilder:
             
             url = f"{self.base_url}/getOwnersForContract"
             params = {
-                "contractAddress": contract_address
+                "contractAddress": contract_address,
+                "excludeFilters[]": "SPAM",
+                "spamConfidenceLevel": "HIGH"
             }
             
             if page_key:
@@ -605,7 +668,7 @@ class NFTGraphBuilder:
         
         logger.info(f"Wallet {wallet[:8]} connected to {len(new_connections)} other wallets, added {new_count} to queue")
     
-    async def build_graph(self, start_wallets=None, max_depth: int = 3, max_nodes: int = 10000, resume_from_checkpoint: bool = False) -> nx.Graph:
+    async def build_graph(self, start_wallets=None, max_depth: int = 3, max_nodes: int = 10000, resume_from_checkpoint: bool = False, seed_wallets: set = None) -> nx.Graph:
         """build graph with performance optimizations
         
         Args:
@@ -613,6 +676,7 @@ class NFTGraphBuilder:
             max_depth: Maximum depth to traverse from starting wallets
             max_nodes: Maximum number of nodes to process
             resume_from_checkpoint: Whether to resume from the latest checkpoint
+            seed_wallets: Set of wallet addresses to mark as "Seed" nodes (for contract mode)
         """
         priority_queue = []
         
@@ -626,12 +690,16 @@ class NFTGraphBuilder:
             initial_wallets = []
         
         # Check if we should resume from checkpoint
+        restored_seed_wallets = None
         if resume_from_checkpoint:
             latest_checkpoint = self.get_latest_checkpoint()
             if latest_checkpoint:
                 checkpoint_data = await self.load_checkpoint_async(latest_checkpoint)
                 if checkpoint_data:
-                    priority_queue = self.restore_state_from_checkpoint(checkpoint_data)
+                    priority_queue, restored_seed_wallets = self.restore_state_from_checkpoint(checkpoint_data)
+                    # Use restored seed wallets if available and no new seed wallets provided
+                    if restored_seed_wallets and not seed_wallets:
+                        seed_wallets = restored_seed_wallets
                     logger.info(f"Resumed from checkpoint with {len(self.visited_wallets_exact)} visited wallets")
                 else:
                     logger.error("Failed to load checkpoint data, starting fresh")
@@ -675,13 +743,13 @@ class NFTGraphBuilder:
                     # Check error thresholds
                     if self.consecutive_errors >= self.max_consecutive_errors:
                         logger.error(f"Hit {self.consecutive_errors} consecutive errors. Pausing to save checkpoint.")
-                        await self.save_checkpoint_async(priority_queue)
+                        await self.save_checkpoint_async(priority_queue, seed_wallets)
                         logger.error("Too many consecutive errors. Please check your API limits and resume later.")
                         return G
                         
                     if self.total_errors >= self.max_total_errors:
                         logger.error(f"Hit {self.total_errors} total errors. Pausing to save checkpoint.")
-                        await self.save_checkpoint_async(priority_queue)
+                        await self.save_checkpoint_async(priority_queue, seed_wallets)
                         logger.error("Too many total errors. Please check your API limits and resume later.")
                         return G
                     
@@ -704,7 +772,7 @@ class NFTGraphBuilder:
                     
                     # checkpoint
                     if self.wallets_processed_since_checkpoint >= self.checkpoint_interval:
-                        await self.save_checkpoint_async(priority_queue)
+                        await self.save_checkpoint_async(priority_queue, seed_wallets)
                         self.wallets_processed_since_checkpoint = 0
                         
                 else:
@@ -717,7 +785,7 @@ class NFTGraphBuilder:
             logger.error(f"Error in build_graph: {e}")
             
             # Always save checkpoint on error
-            await self.save_checkpoint_async(priority_queue)
+            await self.save_checkpoint_async(priority_queue, seed_wallets)
             
             # Special handling for capacity exceeded
             if str(e) == "API_CAPACITY_EXCEEDED":
@@ -735,6 +803,16 @@ class NFTGraphBuilder:
         
         # G is already initialized above
         edge_count = 0
+        
+        # First, add all nodes with attributes
+        for wallet in self.visited_wallets_exact:
+            # Mark seed nodes if provided
+            if seed_wallets and wallet in seed_wallets:
+                G.add_node(wallet, seed=True, label="Seed")
+            else:
+                G.add_node(wallet)
+        
+        # Then add edges
         for wallet, connections in self.edges.items():
             for connected_wallet in connections:
                 shared = len(self.wallet_to_contracts.get(wallet, set()) & 
@@ -756,14 +834,17 @@ class NFTGraphBuilder:
         
         return G
     
-    async def save_checkpoint_async(self, priority_queue):
+    async def save_checkpoint_async(self, priority_queue, seed_wallets=None):
         """async checkpoint saving with cleanup of old checkpoints"""
         logger.info("Saving checkpoint...")
+        start_time = time.time()
+        
+        # No need to convert sets to lists with pickle!
         checkpoint_data = {
-            "visited_wallets": list(self.visited_wallets_exact),
-            "contract_to_owners": {k: list(v) for k, v in self.contract_to_owners.items()},
-            "wallet_to_contracts": {k: list(v) for k, v in self.wallet_to_contracts.items()},
-            "edges": {k: list(v) for k, v in self.edges.items()},
+            "visited_wallets": self.visited_wallets_exact,  # Keep as set
+            "contract_to_owners": self.contract_to_owners,  # Keep sets as sets
+            "wallet_to_contracts": self.wallet_to_contracts,  # Keep sets as sets
+            "edges": self.edges,  # Keep sets as sets
             "queue": [(w.wallet, w.depth, w.priority) for w in priority_queue],
             "stats": {
                 "api_calls": self.api_calls,
@@ -773,10 +854,21 @@ class NFTGraphBuilder:
             }
         }
         
-        filename = f"{self.checkpoint_dir}/checkpoint_{int(time.time())}.json"
-        async with aiofiles.open(filename, 'w') as f:
-            await f.write(ujson.dumps(checkpoint_data))
-        logger.info(f"Checkpoint saved to {filename}")
+        # Save seed wallets if provided
+        if seed_wallets:
+            checkpoint_data["seed_wallets"] = seed_wallets  # Keep as set
+        
+        filename = f"{self.checkpoint_dir}/checkpoint_{int(time.time())}.pkl.gz"
+        
+        # Use synchronous gzip for better performance
+        # (aiofiles doesn't work well with gzip)
+        logger.info(f"Writing checkpoint to {filename}...")
+        with gzip.open(filename, 'wb', compresslevel=1) as f:  # compresslevel=1 for speed
+            pickle.dump(checkpoint_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        
+        elapsed = time.time() - start_time
+        file_size = os.path.getsize(filename) / (1024**2)  # MB
+        logger.info(f"Checkpoint saved to {filename} ({file_size:.1f} MB) in {elapsed:.1f} seconds")
         
         # Clean up old checkpoints, keeping only the last max_checkpoints
         self._cleanup_old_checkpoints()
@@ -784,7 +876,7 @@ class NFTGraphBuilder:
     def _cleanup_old_checkpoints(self):
         """Remove old checkpoint files, keeping only the last max_checkpoints"""
         try:
-            checkpoint_files = glob.glob(os.path.join(self.checkpoint_dir, "checkpoint_*.json"))
+            checkpoint_files = glob.glob(os.path.join(self.checkpoint_dir, "checkpoint_*.pkl.gz"))
             if len(checkpoint_files) <= self.max_checkpoints:
                 return  # No cleanup needed
             
@@ -888,11 +980,15 @@ async def main():
             max_nodes = 10000  # Smaller limit for wallet-based exploration
         
         # Build the graph
+        # Pass seed_wallets only in contract mode
+        seed_wallets_set = set(start_wallets) if mode == "contract" else None
+        
         graph = await builder.build_graph(
             start_wallets=start_wallets,
             max_depth=max_depth,
             max_nodes=max_nodes,
-            resume_from_checkpoint=resume_from_checkpoint
+            resume_from_checkpoint=resume_from_checkpoint,
+            seed_wallets=seed_wallets_set
         )
         
         logger.info(f"Saving graph to {output_file}")
@@ -912,6 +1008,9 @@ async def main():
         
         if mode == "contract":
             stats["total_holders"] = len(start_wallets)
+            # Count seed nodes in final graph
+            seed_count = sum(1 for node, attrs in graph.nodes(data=True) if attrs.get('seed', False))
+            stats["seed_nodes_in_graph"] = seed_count
         
         with open(stats_file, 'w') as f:
             json.dump(stats, f, indent=2)
